@@ -1,0 +1,23 @@
+[project]
+name = "nutcracker-memory"
+version = "0.1.0"
+description = "Bio-inspired persistent episodic memory for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "fastembed",
+    "pydantic",
+    "qdrant-client",
+]
+
+# sqlite3 is supplied by the Python standard library and is intentionally not
+# listed as an installable package.
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,29 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and uv-generated local state
+.venv/
+
+# Coverage and build outputs
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local environment and editor files
+.env
+.env.*
+.idea/
+.vscode/
+*.swp
+
+# Local databases and Qdrant data
+*.db
+*.db-shm
+*.db-wal
+qdrant_storage/
