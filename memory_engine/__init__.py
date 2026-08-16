@@ -1,1 +1,1 @@
-"""Future public package for the bio-inspired episodic memory engine."""
+"""Episodic memory models, anchor resolution, and recall orchestration."""

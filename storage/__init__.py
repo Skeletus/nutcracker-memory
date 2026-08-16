@@ -1,1 +1,1 @@
-"""Future persistence adapters for structural and semantic memory data."""
+"""SQLite persistence for Episodes, anchors, and summary embeddings."""

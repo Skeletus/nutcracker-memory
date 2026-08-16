@@ -8,14 +8,52 @@ repository context across sessions.
 Generic text memory can retrieve a semantically similar note without knowing
 whether the code that made the note true still exists. This creates context
 drift: an old architectural decision can look relevant even after its module,
-dependencies, or validation path changed. Nutcracker Memory proposes anchoring
-episodes to the repository's actual structure and tracking whether those
-anchors remain trustworthy as the code evolves.
+dependencies, or validation path changed. The current MVP anchors Episodes to
+explicit repository-relative files, records complete-file hashes, and checks
+those hashes during recall so semantic relevance and current file integrity
+remain separate signals.
 
-The planned system combines episodic records, a repository graph, semantic
-retrieval, and Git-based structural drift. Structural validity is the primary
-signal for continued trust; elapsed time may later be evaluated as a weak,
-optional feature, not imposed as a hard time-to-live rule.
+## Quick start
+
+Nutcracker is a standard Python package with a cross-platform CLI. Install it
+once with [uv](https://docs.astral.sh/uv/), then initialize it from the
+repository whose history you want to manage:
+
+```text
+uv tool install git+<NUTCRACKER_REPOSITORY_URL>
+cd my-project
+nutcracker init
+nutcracker doctor
+```
+
+`nutcracker init` detects the Git root (or uses the current directory with a
+warning when Git is unavailable), creates a repository-local
+`.nutcracker/memory.db`, adds `.nutcracker/` to `.gitignore`, installs a
+marker-delimited Nutcracker policy block in `AGENTS.md`, and registers an MCP
+server for that repository through Codex's supported `codex mcp add` command.
+No manual edit of `config.toml`, `NUTCRACKER_REPO_ROOT`, or
+`NUTCRACKER_DB_PATH` is required.
+
+One MCP registration intentionally serves one repository. Its readable name
+contains the repository basename and a stable short hash of its resolved path,
+which prevents collisions between repositories with the same name. Run
+`nutcracker init` from each repository you want to use independently.
+
+Codex registers these MCP servers globally for the current user. Therefore,
+initializing several repositories creates several global Nutcracker entries.
+If a repository is moved or renamed, its old entry can become stale; remove it
+with `codex mcp remove <old-name>` and run `nutcracker init` again from the
+new location.
+
+Codex CLI must already be installed and available on `PATH`. The first actual
+memory save or recall may take longer because FastEmbed lazily downloads the
+configured `BAAI/bge-small-en-v1.5` embedding model. It needs network access
+only while that model is absent from FastEmbed's local cache.
+
+The broader research direction may later combine episodic records with a
+repository graph, structural-neighborhood retrieval, and Git-aware identity.
+Those capabilities are not part of the current MVP. Elapsed time is not used
+as a hard time-to-live rule.
 
 ## Scientific grounding
 
@@ -36,9 +74,9 @@ The source set motivates these engineering hypotheses:
   experimentally made unreliable. This motivates redundant, multi-anchor
   episode encoding, while not claiming a known neural representation.
 - Broad, stable environmental structure can matter, and simply adding
-  arbitrary local objects does not necessarily improve recovery. This
-  motivates weighting durable repository structure more strongly than volatile
-  line-level details.
+  arbitrary local objects does not necessarily improve recovery. This informs
+  future experiments with stability-aware anchors; the current MVP weights all
+  file anchors equally.
 - Cache-location memory remained above chance at intervals up to 285 days, but
   the longest interval showed evidence consistent with some forgetting. This
   argues against both aggressive TTL deletion and claims of perfect temporal
@@ -51,50 +89,12 @@ non-mnemonic strategies can be combined flexibly.
 Read the [complete curated scientific basis](docs/nutcracker_scientific_memory_curated.md)
 for evidence levels, limitations, and references.
 
-## Proposed architecture
+## Future direction
 
-The following is an engineering abstraction motivated by the source set:
-
-```text
-Current task + repository position + Git state
-                     |
-                     v
-       Repository graph G = (V, E)
-       nodes: repo/package/module/file/symbol/test/service
-       edges: contains/imports/calls/tests/depends_on/...
-                     |
-          bounded structural neighborhood
-                     |
-                     v
-  +--------------------------------------------------+
-  | Episode                                          |
-  | summary + observations + decision + outcome     |
-  | provenance + explicit validity/state            |
-  |                                                  |
-  | multi-anchor encoding (no single canonical one) |
-  |   +-- structural: repository/module/API          |
-  |   +-- regional:   class/service/route/test suite |
-  |   `-- local:      function/line/local detail     |
-  +--------------------------------------------------+
-                     |
-       semantic relevance + structural support
-                     |
-                     v
-       structural drift reconciliation via Git
-       unchanged / moved / partial / contradicted / gone
-                     |
-                     v
-              compact retrieved context
-
-Landmark stability hierarchy
-
-  HIGH    repository, bounded context, module, public API, schema
-    |     expected to provide durable structural context
-  MEDIUM  class, service, interface, route, test suite
-    |     useful regional context with moderate volatility
-  LOW     function detail, line number, local variable, file offset
-          precise but fragile local context
-```
+The research direction may later explore symbol-level anchors,
+rename-resistant identity, stability-aware anchor weighting, repository maps,
+and structural-neighborhood retrieval. These are engineering hypotheses, not
+current capabilities; the technical roadmap is in [docs/README.md](docs/README.md).
 
 ## What this is NOT
 
@@ -111,8 +111,18 @@ Landmark stability hierarchy
 
 ## Status
 
-Initial scaffold only. The repository contains documentation and module
-boundaries, but no memory engine, retrieval algorithm, scoring implementation,
-storage integration, or MCP tools yet.
+The current MVP implements Episode persistence in SQLite, summary embeddings,
+cosine-similarity retrieval, explicit file anchors, complete-file hash
+revalidation, equal-weight anchor integrity, structural trust/fallback status,
+and `memory_save`/`memory_recall` over MCP stdio. `nutcracker init` also
+installs an agent policy that guides proactive recall/save decisions, but that
+policy is guidance rather than a guarantee that every agent session will call
+the tools.
+
+It does not implement a repository graph, AST or symbol intelligence,
+structural-neighborhood retrieval, rename detection, Git-aware reconciliation,
+semantic contradiction detection, adaptive landmark weighting, or automatic
+fallback exploration. A changed hash proves that file bytes changed; it does
+not prove that the historical decision became invalid.
 
 Implementation guidance and the experiment backlog are in [docs/README.md](docs/README.md).

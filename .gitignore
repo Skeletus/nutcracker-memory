@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtual environments and uv-generated local state
 .venv/
+.uv-cache/
 
 # Coverage and build outputs
 .coverage
@@ -23,7 +24,12 @@ dist/
 *.swp
 
 # Local databases and Qdrant data
+.nutcracker/
 *.db
 *.db-shm
 *.db-wal
 qdrant_storage/
+
+# Local experiments and inaccessible temporary state from development runs
+scratch/
+tmp7ict2kaw/

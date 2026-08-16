@@ -4,11 +4,43 @@ version = "0.1.0"
 description = "Bio-inspired persistent episodic memory for coding agents"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["coding-agents", "episodic-memory", "mcp", "persistent-memory"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
-    "fastapi",
     "fastembed",
-    "pydantic",
-    "qdrant-client",
+    "mcp>=1.26,<2",
+    "pydantic>=2.0,<3.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+nutcracker = "nutcracker_cli.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["memory_engine", "mcp_server", "nutcracker_cli", "storage"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/memory_engine",
+    "/mcp_server",
+    "/nutcracker_cli",
+    "/storage",
+    "/README.md",
+    "/pyproject.toml",
 ]
 
 # sqlite3 is supplied by the Python standard library and is intentionally not
@@ -21,3 +53,4 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
