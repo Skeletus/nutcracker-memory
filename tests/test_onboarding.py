@@ -64,6 +64,16 @@ def _successful_probe(arguments: list[str], timeout: float) -> subprocess.Comple
     return _completed(arguments, json.dumps(["memory_save", "memory_recall"]))
 
 
+@pytest.fixture
+def codex_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make simulated onboarding tests independent from the host PATH."""
+
+    monkeypatch.setattr(
+        "nutcracker_cli.onboarding.shutil.which",
+        lambda executable: "/test/bin/codex",
+    )
+
+
 def _write_mcp_config(
     path: Path,
     repo: Path,
@@ -108,7 +118,10 @@ def test_detect_repo_root_falls_back_when_git_is_not_installed(tmp_path: Path) -
     assert detected.is_git_repository is False
 
 
-def test_init_creates_local_database_and_gitignore_once(tmp_path: Path) -> None:
+def test_init_creates_local_database_and_gitignore_once(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
     calls: list[list[str]] = []
     config_path = tmp_path / "codex" / "config.toml"
 
@@ -201,7 +214,10 @@ def test_agents_policy_fails_without_destroying_malformed_file(tmp_path: Path) -
     assert path.read_text(encoding="utf-8") == original
 
 
-def test_init_is_idempotent_when_mcp_registration_matches(tmp_path: Path) -> None:
+def test_init_is_idempotent_when_mcp_registration_matches(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
     calls: list[list[str]] = []
     config_path = tmp_path / "codex" / "config.toml"
     _write_mcp_config(config_path, tmp_path)
@@ -223,7 +239,10 @@ def test_init_is_idempotent_when_mcp_registration_matches(tmp_path: Path) -> Non
     ).agents_changed is False
 
 
-def test_init_works_with_paths_containing_spaces(tmp_path: Path) -> None:
+def test_init_works_with_paths_containing_spaces(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
     repo = tmp_path / "My Project With Spaces"
     repo.mkdir()
     calls: list[list[str]] = []
