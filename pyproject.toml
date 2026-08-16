@@ -17,11 +17,17 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
 dependencies = [
     "fastembed",
     "mcp>=1.26,<2",
     "pydantic>=2.0,<3.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Skeletus/nutcracker-memory"
+Repository = "https://github.com/Skeletus/nutcracker-memory"
+Issues = "https://github.com/Skeletus/nutcracker-memory/issues"
 
 [build-system]
 requires = ["hatchling>=1.27"]

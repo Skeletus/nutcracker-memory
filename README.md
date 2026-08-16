@@ -20,7 +20,7 @@ once with [uv](https://docs.astral.sh/uv/), then initialize it from the
 repository whose history you want to manage:
 
 ```text
-uv tool install git+<NUTCRACKER_REPOSITORY_URL>
+uv tool install git+https://github.com/Skeletus/nutcracker-memory.git
 cd my-project
 nutcracker init
 nutcracker doctor
