@@ -1,128 +1,257 @@
-# nutcracker-memory
+<p align="center">
+  <img src="docs/assets/nutcracker-logo.png" alt="Nutcracker logo" width="180">
+</p>
 
-`nutcracker-memory` is a persistent memory engine for coding agents, initially
-intended for Codex CLI through the Model Context Protocol (MCP). It is designed
-to retain architectural decisions, investigated bugs, failed approaches, and
-repository context across sessions.
+<h1 align="center">Nutcracker</h1>
 
-Generic text memory can retrieve a semantically similar note without knowing
-whether the code that made the note true still exists. This creates context
-drift: an old architectural decision can look relevant even after its module,
-dependencies, or validation path changed. The current MVP anchors Episodes to
-explicit repository-relative files, records complete-file hashes, and checks
-those hashes during recall so semantic relevance and current file integrity
-remain separate signals.
+<p align="center">
+  <strong>Stale-aware episodic memory for coding agents.</strong><br>
+  Persistent project knowledge with a structural trust check before reuse.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Skeletus/nutcracker-memory/actions/workflows/tests.yml"><img src="https://github.com/Skeletus/nutcracker-memory/actions/workflows/tests.yml/badge.svg" alt="Tests"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT license"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version 0.1.0"></a>
+</p>
+
+Nutcracker gives coding agents persistent episodic memory that is revalidated
+against the current codebase before it is reused. Semantic relevance helps the
+agent find memories that may matter; file-level anchor revalidation tells it
+whether the code context that supported a memory is still intact.
+
+<p align="center">
+  <img src="docs/assets/nutcracker-demo-readme.gif" alt="Nutcracker demo: a memory moves from FOUND to FALLBACK_REQUIRED after an anchored file changes" width="760">
+</p>
+
+<p align="center"><em>Remember → Recall → Code changes → Revalidate</em></p>
+
+## Why Nutcracker?
+
+Coding agents can retrieve an old project note because it is semantically
+similar, even after the code behind that note has changed. Similarity answers
+one question:
+
+> Is this memory relevant?
+
+Nutcracker asks a second question before treating it as trusted:
+
+> Is the file context that supported this memory still intact?
+
+That separation is the product. Nutcracker is a small MCP server and Python
+CLI for durable project knowledge: architectural decisions, investigated bugs,
+rejected approaches, and conventions that should survive a session boundary.
+
+## The demo
+
+The included demo shows a real three-act flow:
+
+1. **Act 1 — remember:** Codex analyzes Flask and saves durable project
+   knowledge with explicit file anchors.
+2. **Act 2 — recall:** a new Codex session recalls the memory as
+   `FOUND · integrity 100%`.
+3. **Act 3 — revalidate:** an anchored Flask file changes, so the same memory
+   becomes `FALLBACK_REQUIRED`.
+
+The current MVP detects file drift, not semantic invalidation. A changed file
+does not prove that the historical decision is wrong; it tells the agent to
+re-check the current repository instead of blindly trusting stale context.
+
+## How it works
+
+When a durable memory is saved, Nutcracker stores:
+
+- the episode: a concise summary and optional decision context;
+- an embedding of the summary for semantic retrieval;
+- one primary repository-relative file anchor and optional related files;
+- a complete-file SHA-256 hash for every anchor at save time.
+
+On recall, Nutcracker embeds the query, retrieves semantically relevant
+episodes, and re-reads their anchored files. It computes equal-weight anchor
+integrity:
+
+```text
+anchor_integrity = valid_anchors / total_anchors
+score = semantic_similarity × anchor_integrity
+```
+
+It then returns one high-level state:
+
+| State | Meaning |
+| --- | --- |
+| `FOUND` | A relevant memory has fully valid file anchors. |
+| `FALLBACK_REQUIRED` | Relevant memories exist, but none is fully structurally valid. Re-check the repository. |
+| `NO_MATCH` | No stored memory passes the semantic relevance filter. |
+
+Recall evaluates current files without rewriting the historical episode or its
+baseline hashes.
 
 ## Quick start
 
-Nutcracker is a standard Python package with a cross-platform CLI. Install it
-once with [uv](https://docs.astral.sh/uv/), then initialize it from the
-repository whose history you want to manage:
+Install the CLI once, initialize it from the repository whose history you want
+to remember, then start Codex:
 
 ```text
 uv tool install git+https://github.com/Skeletus/nutcracker-memory.git
 cd my-project
 nutcracker init
 nutcracker doctor
+codex
 ```
 
-`nutcracker init` detects the Git root (or uses the current directory with a
-warning when Git is unavailable), creates a repository-local
-`.nutcracker/memory.db`, adds `.nutcracker/` to `.gitignore`, installs a
-marker-delimited Nutcracker policy block in `AGENTS.md`, and registers an MCP
-server for that repository through Codex's supported `codex mcp add` command.
-No manual edit of `config.toml`, `NUTCRACKER_REPO_ROOT`, or
-`NUTCRACKER_DB_PATH` is required.
+`nutcracker init` creates `.nutcracker/memory.db`, adds `.nutcracker/` to
+`.gitignore`, installs the Nutcracker policy in `AGENTS.md`, and configures the
+MCP server for Codex. Codex CLI must already be installed and available on
+`PATH`.
 
-One MCP registration intentionally serves one repository. Its readable name
-contains the repository basename and a stable short hash of its resolved path,
-which prevents collisions between repositories with the same name. Run
-`nutcracker init` from each repository you want to use independently.
+To switch the active repository later:
 
-Codex registers these MCP servers globally for the current user. Therefore,
-initializing several repositories creates several global Nutcracker entries.
-If a repository is moved or renamed, its old entry can become stale; remove it
-with `codex mcp remove <old-name>` and run `nutcracker init` again from the
-new location.
+```text
+cd another-project
+nutcracker use
+nutcracker doctor
+codex
+```
 
-Codex CLI must already be installed and available on `PATH`. The first actual
-memory save or recall may take longer because FastEmbed lazily downloads the
-configured `BAAI/bge-small-en-v1.5` embedding model. It needs network access
-only while that model is absent from FastEmbed's local cache.
+The current MVP supports **one active repository at a time**. `nutcracker use`
+changes the repository used by the next Codex session; it does not retarget an
+already open session. Simultaneous Codex sessions for different repositories
+are not supported safely.
 
-The broader research direction may later combine episodic records with a
-repository graph, structural-neighborhood retrieval, and Git-aware identity.
-Those capabilities are not part of the current MVP. Elapsed time is not used
-as a hard time-to-live rule.
+The first save or recall may take longer because FastEmbed lazily downloads the
+configured `BAAI/bge-small-en-v1.5` model. Network access is needed only while
+the model is absent from the local cache.
 
-## Scientific grounding
+## CLI
 
-Nutcracker Memory is **bio-inspired engineering**, not a reproduction of a
-known biological algorithm. In the precise language of the curated source:
+| Command | Purpose |
+| --- | --- |
+| `nutcracker init` | Initialize this repository and activate its MCP configuration. |
+| `nutcracker use` | Select an already initialized repository for the next Codex session. |
+| `nutcracker doctor` | Check the repository, database, policy, and Codex MCP setup. |
 
-> Nutcracker explores a computational memory architecture inspired by
-> experimentally observed properties of spatial memory in Clark's
-> nutcrackers, including multi-landmark encoding, reliance on stable
-> structural cues, long-term persistence, and flexible cue use.
+## MCP experience
 
-The source set motivates these engineering hypotheses:
+Nutcracker exposes two MCP tools: `memory_save` and `memory_recall`.
+Human-readable results stay compact while structured results remain available
+to the client:
 
-- Clark's nutcrackers use spatial information to recover caches; recovery
-  cannot be reduced to detecting the cached seed. This motivates anchoring a
-  memory to an environment model instead of storing only free text.
-- Multiple landmarks can preserve search accuracy when another spatial cue is
-  experimentally made unreliable. This motivates redundant, multi-anchor
-  episode encoding, while not claiming a known neural representation.
-- Broad, stable environmental structure can matter, and simply adding
-  arbitrary local objects does not necessarily improve recovery. This informs
-  future experiments with stability-aware anchors; the current MVP weights all
-  file anchors equally.
-- Cache-location memory remained above chance at intervals up to 285 days, but
-  the longest interval showed evidence consistent with some forgetting. This
-  argues against both aggressive TTL deletion and claims of perfect temporal
-  permanence.
+```text
+Nutcracker · Memory saved
 
-Applegate and Aronov's work concerns **black-capped chickadees**, not Clark's
-nutcrackers. It is used only as comparative evidence that mnemonic and
-non-mnemonic strategies can be combined flexibly.
+Nutcracker · Memory recalled
+FOUND · integrity 100%
 
-Read the [complete curated scientific basis](docs/nutcracker_scientific_memory_curated.md)
-for evidence levels, limitations, and references.
+Nutcracker · Memory may be stale
+FALLBACK_REQUIRED · integrity 86%
 
-## Future direction
+Nutcracker · No relevant memory
+NO_MATCH
+```
 
-The research direction may later explore symbol-level anchors,
-rename-resistant identity, stability-aware anchor weighting, repository maps,
-and structural-neighborhood retrieval. These are engineering hypotheses, not
-current capabilities; the technical roadmap is in [docs/README.md](docs/README.md).
+The public `memory_save` contract uses explicit file paths relative to the
+active repository:
 
-## What this is NOT
+```json
+{
+  "summary": "Flask keeps application and request context responsibilities separate.",
+  "primary_path": "src/flask/ctx.py",
+  "related_paths": ["src/flask/app.py", "src/flask/globals.py"],
+  "type": "decision"
+}
+```
 
-- It is not an exact reproduction of avian memory, and it does not claim to
-  implement "the Clark's nutcracker algorithm"; no complete algorithm is known
-  from the cited literature.
-- It is not a claim that memories never decay with time. Any temporal signal
-  must be tested experimentally and must not substitute for structural
-  validation.
-- It is not a replacement for structural code-graph tools such as
-  `codebase-memory-mcp`. Those tools model code structure; this project is
-  intended to complement that layer with persistent episodic memory tied to
-  the structure.
+Anchors must be existing whole files. `primary_path` identifies the main
+anchor; `related_paths` add supporting files.
 
-## Status
+## Architecture
 
-The current MVP implements Episode persistence in SQLite, summary embeddings,
-cosine-similarity retrieval, explicit file anchors, complete-file hash
-revalidation, equal-weight anchor integrity, structural trust/fallback status,
-and `memory_save`/`memory_recall` over MCP stdio. `nutcracker init` also
-installs an agent policy that guides proactive recall/save decisions, but that
-policy is guidance rather than a guarantee that every agent session will call
-the tools.
+```text
+Codex
+  ↓
+MCP server: nutcracker
+  ↓
+memory_save / memory_recall
+  ↓
+semantic retrieval + file-anchor revalidation
+  ↓
+<repo>/.nutcracker/memory.db
+```
 
-It does not implement a repository graph, AST or symbol intelligence,
-structural-neighborhood retrieval, rename detection, Git-aware reconciliation,
-semantic contradiction detection, adaptive landmark weighting, or automatic
-fallback exploration. A changed hash proves that file bytes changed; it does
-not prove that the historical decision became invalid.
+The implementation is intentionally small: Python, SQLite, summary embeddings,
+cosine similarity, and complete-file hash checks. See the
+[implementation notes and research backlog](docs/README.md) for the detailed
+status matrix, scoring policy, schema notes, and experiment ideas.
 
-Implementation guidance and the experiment backlog are in [docs/README.md](docs/README.md).
+## Scientific inspiration
+
+The name and research direction are inspired by spatial-memory findings
+associated with Clark's nutcrackers: memories can be tied to environmental
+landmarks, multiple cues can support retrieval, and context can matter when a
+cue becomes unreliable.
+
+Those findings motivate engineering questions; they do not specify a known
+biological or computational algorithm. Nutcracker's current mechanisms—file
+anchors, SHA-256 baselines, summary embeddings, equal-weight integrity, and
+the three recall states—are engineering choices of this project, not a claimed
+simulation of a bird's memory. The
+[curated scientific basis](docs/nutcracker_scientific_memory_curated.md)
+records the evidence and its caveats.
+
+## Current scope: v0.1.0
+
+The MVP deliberately has a narrow, inspectable scope:
+
+- file-level anchors only; any byte change marks that anchor changed;
+- no semantic understanding of whether a change invalidates a memory;
+- no symbol-level AST anchors and no rename tracking;
+- one active repository at a time, with no safe simultaneous multi-repo
+  sessions;
+- `AnchorLevel` and `AnchorRelation` exist internally but do not affect current
+  retrieval or scoring;
+- `FALLBACK_REQUIRED` is a signal to re-check the repository; Nutcracker does
+  not repair code or automatically explore a fallback.
+
+These are boundaries of the current MVP, not promises about future behavior.
+
+## What this is not
+
+Nutcracker is not:
+
+- a full code-intelligence graph or a replacement for codebase indexing;
+- a semantic code-diff engine or automatic contradiction detector;
+- a production-scale vector database or a claim of production readiness;
+- a faithful biological simulation or an implementation of a “Clark's
+  nutcracker memory algorithm.”
+
+Codebase intelligence tools help answer, “What does the current repository look
+like?” Nutcracker addresses a complementary question: “What did we conclude
+before, and how much should we trust that memory against the repository today?”
+
+## Development
+
+Clone the repository, install development dependencies, and run the test suite:
+
+```text
+uv sync --dev
+uv run pytest -v
+uv build
+```
+
+The GitHub Actions workflow runs the same test and build checks on pushes and
+pull requests. The project is early-stage and its MVP hypothesis is still to
+be evaluated: whether file-anchor revalidation reduces stale-memory use without
+creating too many false warnings.
+
+## Roadmap
+
+Future experiments may explore symbol-level anchors, rename-resistant identity,
+stability-aware anchor weighting, repository maps, structural-neighborhood
+retrieval, and caller-driven fallback exploration. These are hypotheses, not
+current capabilities. The [research backlog](docs/README.md) describes them
+in more detail.
+
+## License
+
+Nutcracker is released under the [MIT License](LICENSE).

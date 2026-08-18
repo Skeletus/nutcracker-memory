@@ -26,6 +26,7 @@ from storage.episode_store import init_db
 AGENTS_START = "<!-- nutcracker:start -->"
 AGENTS_END = "<!-- nutcracker:end -->"
 DEFAULT_DB_RELATIVE_PATH = Path(".nutcracker") / "memory.db"
+ACTIVE_MCP_NAME = "nutcracker"
 CommandRunner = Callable[[Sequence[str], Path | None], subprocess.CompletedProcess[str]]
 ProbeRunner = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
 # Fresh FastEmbed/MCP environments can take several seconds to import on slower
@@ -68,14 +69,22 @@ class InitResult:
 
 
 @dataclass(frozen=True, slots=True)
+class UseResult:
+    """The repository selected for the next Codex session."""
+
+    repo_root: Path
+    mcp_changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class DoctorResult:
     """Individual checks performed without mutating repository configuration."""
 
-    checks: tuple[tuple[str, bool, str], ...]
+    checks: tuple[DoctorCheck, ...]
 
     @property
     def ready(self) -> bool:
-        return all(ok for _, ok, _ in self.checks)
+        return all(check.ok for check in self.checks)
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +95,19 @@ class MCPConfiguration:
     entry: Mapping[str, object] | None
     matches: bool
     issues: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DoctorCheck:
+    """A doctor result with an explicit human-facing severity."""
+
+    name: str
+    status: str
+    detail: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
 
 
 def _run_command(
@@ -137,11 +159,10 @@ def detect_repo_root(
 
 
 def mcp_server_name(repo_root: Path) -> str:
-    """Create a readable, stable name unique to an absolute local repository.
+    """Return the legacy per-repository MCP name used by earlier MVP releases.
 
-    The basename keeps `codex mcp list` understandable; a short SHA-256 digest
-    of the resolved path avoids collisions between repositories with the same
-    basename. One MCP registration intentionally serves one repository.
+    It remains available solely to identify registrations that users may remove
+    manually after moving to the single active ``nutcracker`` server.
     """
 
     root = repo_root.expanduser().resolve()
@@ -149,6 +170,17 @@ def mcp_server_name(repo_root: Path) -> str:
     slug = slug[:MAX_MCP_SLUG_LENGTH].rstrip("-") or "repository"
     digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:8]
     return f"nutcracker-{slug}-{digest}"
+
+
+def legacy_mcp_names(config: Mapping[str, object]) -> tuple[str, ...]:
+    """List old Nutcracker registrations without selecting or modifying them."""
+
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, Mapping):
+        return ()
+    return tuple(
+        sorted(name for name in servers if isinstance(name, str) and name.startswith("nutcracker-"))
+    )
 
 
 def _agents_template() -> str:
@@ -285,7 +317,7 @@ def inspect_mcp_configuration(
 ) -> MCPConfiguration:
     """Explain whether an existing MCP record is safe for this installation."""
 
-    name = mcp_server_name(repo_root)
+    name = ACTIVE_MCP_NAME
     if entry is None:
         return MCPConfiguration(name, None, False, ("registration is missing",))
     environment = entry.get("env")
@@ -315,15 +347,6 @@ def inspect_mcp_configuration(
     if configured_db is not None and configured_db != expected_db:
         issues.append(f"database is {str(configured_db)!r}, expected {str(expected_db)!r}")
     return MCPConfiguration(name, entry, not issues, tuple(issues))
-
-
-def _format_mcp_conflict(configuration: MCPConfiguration) -> str:
-    details = "; ".join(configuration.issues)
-    return (
-        "Existing MCP registration differs from Nutcracker's expected configuration. "
-        f"Name: {configuration.name}. Details: {details}. "
-        f"Review it, then run `codex mcp remove {configuration.name}` and retry `nutcracker init`."
-    )
 
 
 def _resolve_codex(codex_executable: str = "codex") -> str:
@@ -365,7 +388,7 @@ def build_mcp_add_command(
     """Build the official CLI registration command without platform shell syntax."""
 
     resolved_root = repo_root.expanduser().resolve()
-    selected_name = name or mcp_server_name(resolved_root)
+    selected_name = name or ACTIVE_MCP_NAME
     selected_python = python_executable or sys.executable
     return [
         codex_executable,
@@ -381,7 +404,39 @@ def build_mcp_add_command(
     ]
 
 
-def ensure_mcp_registration(
+def _build_mcp_remove_command(name: str, codex_executable: str) -> list[str]:
+    """Build Codex's supported removal command without shell interpolation."""
+
+    return [codex_executable, "mcp", "remove", name]
+
+
+def _build_restore_command(
+    configuration: Mapping[str, object],
+    *,
+    codex_executable: str,
+) -> list[str] | None:
+    """Recreate a prior standard stdio registration after a failed switch.
+
+    The active registration is only replaced when it already has Nutcracker's
+    command shape. Its command, arguments, and string environment entries are
+    sufficient for the supported ``codex mcp add`` form.
+    """
+
+    command = configuration.get("command")
+    arguments = configuration.get("args")
+    environment = configuration.get("env")
+    if not isinstance(command, str) or not isinstance(arguments, list) or not isinstance(environment, Mapping):
+        return None
+    restored = [codex_executable, "mcp", "add", ACTIVE_MCP_NAME]
+    for key, value in environment.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            return None
+        restored.extend(["--env", f"{key}={value}"])
+    restored.extend(["--", command, *[str(argument) for argument in arguments]])
+    return restored
+
+
+def ensure_active_mcp_registration(
     repo_root: Path,
     *,
     runner: CommandRunner = _run_command,
@@ -389,35 +444,55 @@ def ensure_mcp_registration(
     codex_executable: str = "codex",
     config_path: Path | None = None,
 ) -> bool:
-    """Register the installed stdio server once using Codex's public CLI.
+    """Select one initialized repository for the next Codex session.
 
-    A missing registration is added and a matching registration is left intact.
-    A registration with the expected name but different configuration raises
-    ``MCPConflictError``; the user must resolve that conflict manually before
-    retrying setup.
+    A missing active server is registered, a matching one is left intact, and
+    a recognizable Nutcracker server for another repository is deliberately
+    replaced because the user explicitly invoked ``nutcracker use``/``init``.
+    If the replacement add fails, the prior standard registration is restored
+    when possible. A non-Nutcracker entry named ``nutcracker`` is never removed.
     """
 
     selected_python = python_executable or sys.executable
     selected_codex = _resolve_codex(codex_executable)
-    name = mcp_server_name(repo_root)
-    entry = _mcp_entry(_read_codex_config(config_path), name)
+    entry = _mcp_entry(_read_codex_config(config_path), ACTIVE_MCP_NAME)
     configuration = inspect_mcp_configuration(entry, repo_root, selected_python)
-    if entry is not None and not configuration.matches:
-        raise MCPConflictError(_format_mcp_conflict(configuration))
     if configuration.matches:
         return False
+
+    if entry is not None:
+        if entry.get("args") != ["-m", "mcp_server.server"] or not isinstance(entry.get("env"), Mapping):
+            raise MCPConflictError(
+                "The MCP registration named 'nutcracker' is not a recognizable Nutcracker "
+                "stdio server. It was not changed; resolve the name conflict manually."
+            )
+        removed = runner(_build_mcp_remove_command(ACTIVE_MCP_NAME, selected_codex), None)
+        if removed.returncode != 0:
+            raise MCPRegistrationError(removed.stderr.strip() or "Could not switch active Nutcracker MCP")
 
     added = runner(
         build_mcp_add_command(
             repo_root,
-            name=name,
+            name=ACTIVE_MCP_NAME,
             python_executable=selected_python,
             codex_executable=selected_codex,
         ),
         None,
     )
     if added.returncode != 0:
-        raise MCPRegistrationError(added.stderr.strip() or "Could not register Nutcracker MCP")
+        if entry is not None:
+            restore = _build_restore_command(entry, codex_executable=selected_codex)
+            if restore is not None:
+                restored = runner(restore, None)
+                if restored.returncode == 0:
+                    raise MCPRegistrationError(
+                        "Could not activate the requested repository; the previous Nutcracker "
+                        "registration was restored. " + (added.stderr.strip() or "codex mcp add failed")
+                    )
+        raise MCPRegistrationError(
+            "Could not activate the requested repository. "
+            + (added.stderr.strip() or "codex mcp add failed")
+        )
     return True
 
 
@@ -429,23 +504,19 @@ def initialize_repository(
     codex_executable: str = "codex",
     config_path: Path | None = None,
 ) -> InitResult:
-    """Create all repository-local setup state and register one MCP server."""
+    """Create repository-local setup state and make it the active MCP target."""
 
     detected = detect_repo_root(cwd, runner=runner)
     repo_root = detected.path
     selected_python = python_executable or sys.executable
     selected_codex = preflight_codex(runner=runner, codex_executable=codex_executable)
-    existing = _mcp_entry(_read_codex_config(config_path), mcp_server_name(repo_root))
-    configuration = inspect_mcp_configuration(existing, repo_root, selected_python)
-    if existing is not None and not configuration.matches:
-        raise MCPConflictError(_format_mcp_conflict(configuration))
     memory_directory = repo_root / ".nutcracker"
     memory_directory.mkdir(parents=True, exist_ok=True)
     db_path = memory_directory / "memory.db"
     init_db(str(db_path))
     gitignore_changed = ensure_gitignore(repo_root)
     agents_changed = install_agents_policy(repo_root)
-    mcp_changed = ensure_mcp_registration(
+    mcp_changed = ensure_active_mcp_registration(
         repo_root,
         runner=runner,
         python_executable=selected_python,
@@ -455,12 +526,41 @@ def initialize_repository(
     return InitResult(
         repo_root=repo_root,
         db_path=db_path,
-        mcp_name=mcp_server_name(repo_root),
+        mcp_name=ACTIVE_MCP_NAME,
         is_git_repository=detected.is_git_repository,
         gitignore_changed=gitignore_changed,
         agents_changed=agents_changed,
         mcp_changed=mcp_changed,
     )
+
+
+def use_repository(
+    cwd: Path | None = None,
+    *,
+    runner: CommandRunner = _run_command,
+    python_executable: str | None = None,
+    codex_executable: str = "codex",
+    config_path: Path | None = None,
+) -> UseResult:
+    """Make an already initialized repository active for the next Codex session."""
+
+    detected = detect_repo_root(cwd, runner=runner)
+    repo_root = detected.path
+    db_ok, db_detail = _database_check(repo_root / DEFAULT_DB_RELATIVE_PATH)
+    if not db_ok:
+        raise ValueError(f"Nutcracker is not initialized here: {db_detail}")
+    policy_ok, policy_detail = _agents_policy_check(repo_root / "AGENTS.md")
+    if not policy_ok:
+        raise ValueError(f"Nutcracker policy is not ready: {policy_detail}")
+    selected_codex = preflight_codex(runner=runner, codex_executable=codex_executable)
+    changed = ensure_active_mcp_registration(
+        repo_root,
+        runner=runner,
+        python_executable=python_executable,
+        codex_executable=selected_codex,
+        config_path=config_path,
+    )
+    return UseResult(repo_root=repo_root, mcp_changed=changed)
 
 
 def _database_check(db_path: Path) -> tuple[bool, str]:
@@ -552,29 +652,42 @@ def run_doctor(
     detected = detect_repo_root(cwd)
     repo_root = detected.path
     db_path = repo_root / DEFAULT_DB_RELATIVE_PATH
-    name = mcp_server_name(repo_root)
+    name = ACTIVE_MCP_NAME
     codex = shutil.which("codex")
     entry: Mapping[str, object] | None = None
     configuration: MCPConfiguration | None = None
     config_error: str | None = None
     try:
-        entry = _mcp_entry(_read_codex_config(config_path), name)
+        config = _read_codex_config(config_path)
+        entry = _mcp_entry(config, name)
+        legacy = legacy_mcp_names(config)
         if codex is not None:
             configuration = inspect_mcp_configuration(entry, repo_root, sys.executable)
     except ValueError as error:
         config_error = str(error)
+        legacy = ()
 
-    checks: list[tuple[str, bool, str]] = [
-        ("Repository", True, str(repo_root)),
-        ("Local memory directory", (repo_root / ".nutcracker").is_dir(), str(repo_root / ".nutcracker")),
-        ("SQLite", *_database_check(db_path)),
-        ("AGENTS.md policy", *_agents_policy_check(repo_root / "AGENTS.md")),
-        ("Codex CLI", codex is not None, codex or "codex was not found on PATH"),
+    database_ok, database_detail = _database_check(db_path)
+    policy_ok, policy_detail = _agents_policy_check(repo_root / "AGENTS.md")
+    checks: list[DoctorCheck] = [
+        DoctorCheck("Repository", "ok", str(repo_root)),
+        DoctorCheck("Local memory directory", "ok" if (repo_root / ".nutcracker").is_dir() else "error", str(repo_root / ".nutcracker")),
+        DoctorCheck("SQLite", "ok" if database_ok else "error", database_detail),
+        DoctorCheck("AGENTS.md policy", "ok" if policy_ok else "error", policy_detail),
+        DoctorCheck("Codex CLI", "ok" if codex is not None else "error", codex or "codex was not found on PATH"),
     ]
     if config_error:
-        checks.append(("MCP registration", False, config_error))
+        checks.append(DoctorCheck("MCP registration", "error", config_error))
     else:
         registration_ok = configuration is not None and configuration.matches
+        active_root = ""
+        if entry is not None and isinstance(entry.get("env"), Mapping):
+            active_root = str(entry["env"].get("NUTCRACKER_REPO_ROOT", ""))
+        other_repository_active = (
+            entry is not None
+            and active_root
+            and Path(active_root).expanduser().resolve() != repo_root.resolve()
+        )
         registration_detail = (
             name
             if registration_ok
@@ -583,16 +696,23 @@ def run_doctor(
             else f"{name} is not registered"
         )
         checks.append(
-            (
+            DoctorCheck(
                 "MCP registration",
-                registration_ok,
-                registration_detail,
+                "ok" if registration_ok else "warn" if other_repository_active else "error",
+                (
+                    f"Nutcracker is initialized here but another repository is active. "
+                    f"Active: {active_root}. Current: {repo_root}. Run: nutcracker use"
+                    if other_repository_active
+                    else registration_detail
+                ),
             )
         )
     if configuration is not None and configuration.matches:
-        checks.append(("MCP server process and tools", *_server_tools_check(
-            str(entry["command"]), probe_runner=probe_runner
-        )))
+        process_ok, process_detail = _server_tools_check(str(entry["command"]), probe_runner=probe_runner)
+        checks.append(DoctorCheck("MCP server process and tools", "ok" if process_ok else "error", process_detail))
     else:
-        checks.append(("MCP server process and tools", False, "MCP registration is not valid"))
+        checks.append(DoctorCheck("MCP server process and tools", "error", "MCP registration is not valid"))
+    if legacy:
+        commands = "; ".join(f"codex mcp remove {legacy_name}" for legacy_name in legacy)
+        checks.append(DoctorCheck("Legacy MCP registrations", "warn", f"Detected: {', '.join(legacy)}. Remove manually: {commands}"))
     return DoctorResult(tuple(checks))

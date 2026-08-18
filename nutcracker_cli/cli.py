@@ -11,6 +11,7 @@ from nutcracker_cli.onboarding import (
     MCPRegistrationError,
     initialize_repository,
     run_doctor,
+    use_repository,
 )
 
 
@@ -18,6 +19,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="nutcracker", description="Nutcracker Memory setup")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("init", help="Initialize Nutcracker in the current repository")
+    subparsers.add_parser("use", help="Select this repository for the next Codex session")
     subparsers.add_parser("doctor", help="Check Nutcracker setup in the current repository")
     return parser
 
@@ -33,7 +35,7 @@ def _run_init() -> int:
     print("[OK] Added .nutcracker/ to .gitignore" if result.gitignore_changed else "[OK] .gitignore already configured")
     print("[OK] Installed Nutcracker policy in AGENTS.md" if result.agents_changed else "[OK] Nutcracker policy already current")
     print(
-        f"[OK] {'Registered' if result.mcp_changed else 'Verified'} Codex MCP: {result.mcp_name}"
+        f"[OK] {'Activated' if result.mcp_changed else 'Verified'} Codex MCP: {result.mcp_name}"
     )
     print("\nNutcracker is ready.\n\nRun:\n  nutcracker doctor")
     return 0
@@ -42,25 +44,37 @@ def _run_init() -> int:
 def _run_doctor() -> int:
     result = run_doctor(Path.cwd())
     print("Nutcracker doctor\n")
-    for name, ok, detail in result.checks:
-        prefix = "[OK]" if ok else "[ERROR]"
-        print(f"{prefix} {name}: {detail}")
+    for check in result.checks:
+        prefix = {"ok": "[OK]", "warn": "[WARN]", "error": "[ERROR]"}[check.status]
+        print(f"{prefix} {check.name}: {check.detail}")
     print("\nReady." if result.ready else "\nNot ready. Run `nutcracker init` or address the errors above.")
     return 0 if result.ready else 1
+
+
+def _run_use() -> int:
+    result = use_repository(Path.cwd())
+    if result.mcp_changed:
+        print(f"Nutcracker · Active repository\n{result.repo_root}")
+    else:
+        print(f"Nutcracker · Repository already active\n{result.repo_root.name}")
+    print("Start a new Codex session to use this repository's memory.")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the public CLI and return a portable process status."""
 
     arguments = _parser().parse_args(argv)
-    if arguments.command == "init":
+    if arguments.command in {"init", "use"}:
         try:
-            return _run_init()
+            return _run_init() if arguments.command == "init" else _run_use()
         except CodexPreflightError as error:
             print(f"[ERROR] {error}")
             return 1
         except MCPConflictError as error:
-            print(f"[ERROR] {error}\nNo project files were changed.")
+            if arguments.command == "init":
+                print("[ERROR] Local Nutcracker setup completed, but MCP activation needs attention.")
+            print(f"[ERROR] {error}")
             return 1
         except MCPRegistrationError as error:
             print("[ERROR] Local Nutcracker setup completed, but MCP registration failed.")

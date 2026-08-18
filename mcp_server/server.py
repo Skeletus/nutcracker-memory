@@ -13,13 +13,12 @@ import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
-from pydantic import BaseModel
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import Field
 
 from memory_engine.anchor_resolver import SymbolNotFoundError
 from memory_engine.core import memory_recall as core_memory_recall
@@ -29,7 +28,6 @@ from storage.episode_store import init_db
 
 
 LOGGER = logging.getLogger(__name__)
-EnumT = TypeVar("EnumT", bound=Enum)
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,12 +38,14 @@ class ServerConfig:
     db_path: Path
 
 
-class AnchorInput(BaseModel):
-    """JSON-friendly anchor specification accepted by the save tool."""
-
-    symbol: str
-    level: str
-    relation: str
+EPISODE_TYPE_ALIASES = {
+    "architectural_decision": EpisodeType.DECISION.value,
+    "architecture_decision": EpisodeType.DECISION.value,
+    "bugfix": EpisodeType.BUG_FIX.value,
+    "fix": EpisodeType.BUG_FIX.value,
+    "failed_attempt": EpisodeType.FAILED_APPROACH.value,
+    "note": EpisodeType.OBSERVATION.value,
+}
 
 
 def load_config(environment: Mapping[str, str] | None = None) -> ServerConfig:
@@ -80,56 +80,106 @@ def load_config(environment: Mapping[str, str] | None = None) -> ServerConfig:
     return ServerConfig(repo_root=repo_root, db_path=db_path)
 
 
-def _parse_enum(enum_type: type[EnumT], value: str, field_name: str) -> EnumT:
-    """Convert one MCP string to an existing internal enum with a clear error."""
+def _invalid_anchor_path(path: str) -> ValueError:
+    """Return an actionable public error for an invalid whole-file anchor."""
 
-    try:
-        return enum_type(value)
-    except ValueError as error:
-        allowed = ", ".join(member.value for member in enum_type)
-        raise ValueError(
-            f"Invalid {field_name} {value!r}; expected one of: {allowed}"
-        ) from error
+    return ValueError(
+        f'Invalid anchor path: "{path}".\n\n'
+        "The path must reference an existing file relative to the repository "
+        "root. Nutcracker MVP tracks anchors at whole-file level, not individual "
+        "code symbols. If you mean a class or function, anchor the file containing it."
+    )
 
 
-def _validate_anchor_path(repo_root: Path, symbol: str) -> None:
+def _validate_anchor_path(repo_root: Path, path: str) -> None:
     """Reject absolute paths and any relative path escaping ``repo_root``.
 
     ``Path.resolve`` follows existing symlinks, so this check also rejects a
     repository-local symlink whose target is outside the configured tree.
     """
 
-    candidate = Path(symbol)
+    candidate = Path(path)
     if candidate.is_absolute():
-        raise ValueError("Anchor symbol must be a path relative to the repository")
+        raise _invalid_anchor_path(path)
 
     resolved = (repo_root / candidate).resolve()
     if not resolved.is_relative_to(repo_root):
-        raise ValueError("Anchor symbol must remain within the configured repository")
+        raise _invalid_anchor_path(path)
+    if not resolved.is_file():
+        raise _invalid_anchor_path(path)
+
+
+def _normalize_episode_type(requested_type: str) -> tuple[EpisodeType, bool]:
+    """Return a canonical EpisodeType and whether an unknown value fell back."""
+
+    normalized = requested_type.strip().lower()
+    canonical = EPISODE_TYPE_ALIASES.get(normalized, normalized)
+    try:
+        return EpisodeType(canonical), False
+    except ValueError:
+        return EpisodeType.OBSERVATION, True
+
+
+def _normalize_related_paths(
+    primary_path: str,
+    related_paths: list[str],
+) -> list[str]:
+    """Remove primary and duplicate related paths while preserving first order."""
+
+    seen = {primary_path}
+    normalized: list[str] = []
+    for path in related_paths:
+        if path not in seen:
+            seen.add(path)
+            normalized.append(path)
+    return normalized
+
+
+def _build_anchor_specs(
+    primary_path: str,
+    related_paths: list[str],
+) -> list[tuple[str, AnchorLevel, AnchorRelation]]:
+    """Translate the MCP-only shape to the engine's unchanged anchor tuples."""
+
+    # LOCAL is a placeholder, not an inferred hierarchy; level does not yet
+    # affect recall or scoring and can be inferred more meaningfully later.
+    # DEPENDENCY is the neutral related-anchor default, not an inferred code
+    # dependency; relation likewise does not yet affect recall or scoring.
+    return [
+        (
+            primary_path,
+            AnchorLevel.LOCAL,
+            AnchorRelation.PRIMARY,
+        ),
+        *[
+            (
+                path,
+                AnchorLevel.LOCAL,
+                AnchorRelation.DEPENDENCY,
+            )
+            for path in related_paths
+        ],
+    ]
 
 
 def handle_memory_save(
     config: ServerConfig,
     summary: str,
-    anchors: list[AnchorInput],
+    primary_path: str,
+    related_paths: list[str] | None = None,
     type: str = EpisodeType.OBSERVATION.value,
     observations: list[str] | None = None,
     decision: str | None = None,
 ) -> dict[str, Any]:
     """Validate MCP input, delegate to core ``memory_save``, and compact output."""
 
-    for anchor in anchors:
-        _validate_anchor_path(config.repo_root, anchor.symbol)
+    related = _normalize_related_paths(primary_path, related_paths or [])
+    public_paths = [primary_path, *related]
+    for path in public_paths:
+        _validate_anchor_path(config.repo_root, path)
 
-    episode_type = _parse_enum(EpisodeType, type, "episode type")
-    anchor_specs = [
-        (
-            anchor.symbol,
-            _parse_enum(AnchorLevel, anchor.level, "anchor level"),
-            _parse_enum(AnchorRelation, anchor.relation, "anchor relation"),
-        )
-        for anchor in anchors
-    ]
+    episode_type, type_fallback = _normalize_episode_type(type)
+    anchor_specs = _build_anchor_specs(primary_path, related)
 
     try:
         episode = core_memory_save(
@@ -138,26 +188,29 @@ def handle_memory_save(
             summary=summary,
             anchor_specs=anchor_specs,
             type=episode_type,
-            observations=observations,
+            observations=list(observations or []),
             decision=decision,
         )
     except SymbolNotFoundError as error:
         # Return only the repository-relative input, not a host absolute path.
         missing_symbol = next(
             (
-                anchor.symbol
-                for anchor in anchors
-                if (config.repo_root / anchor.symbol).resolve()
+                path
+                for path in public_paths
+                if (config.repo_root / path).resolve()
                 == Path(error.filepath).resolve()
             ),
             "requested anchor",
         )
-        raise ValueError(f"Anchor file does not exist: {missing_symbol}") from None
+        raise _invalid_anchor_path(missing_symbol) from None
 
     return {
         "status": "saved",
         "episode_id": episode.id,
         "summary": episode.summary,
+        "requested_type": type,
+        "stored_type": episode.type.value,
+        "type_fallback": type_fallback,
         "anchors": [
             {
                 "symbol": anchor.symbol,
@@ -208,6 +261,53 @@ def handle_memory_recall(
     }
 
 
+def _compact_save_content(result: Mapping[str, Any]) -> str:
+    """Return the small human-facing summary while retaining structured data."""
+
+    return (
+        "Nutcracker · Memory saved\n"
+        f"Episode {result['episode_id']} · {len(result['anchors'])} anchors"
+    )
+
+
+def _compact_recall_content(result: Mapping[str, Any]) -> str:
+    """Return a bounded human summary for the recall status and best result."""
+
+    status = result["status"]
+    memories = result["results"]
+    if status == "no_match":
+        return "Nutcracker · No relevant memory\nNO_MATCH"
+
+    best = memories[0]
+    integrity = f"{best['anchor_integrity']:.0%}"
+    if status == "found":
+        return (
+            "Nutcracker · Memory recalled\n"
+            f"FOUND · integrity {integrity}\n"
+            f"{len(memories)} memories · best score {best['score']:.2f}"
+        )
+
+    anchors = best["anchors"]
+    visible = anchors[:3]
+    anchor_lines = [f"{anchor['symbol']} · {anchor['state'].upper()}" for anchor in visible]
+    if len(anchors) > len(visible):
+        anchor_lines.append(f"+{len(anchors) - len(visible)} more")
+    return (
+        "Nutcracker · Memory may be stale\n"
+        f"FALLBACK_REQUIRED · integrity {integrity}\n\n"
+        + "\n".join(anchor_lines)
+    )
+
+
+def _tool_result(text: str, structured: dict[str, Any]) -> CallToolResult:
+    """Build official MCP content plus structured content without stdio prints."""
+
+    return CallToolResult(
+        content=[TextContent(type="text", text=text)],
+        structuredContent=structured,
+    )
+
+
 _server_config: ServerConfig | None = None
 
 
@@ -229,7 +329,7 @@ mcp = FastMCP(
     "nutcracker",
     instructions=(
         "Persistent episodic memory for the configured repository. "
-        "Anchor symbols are repository-relative file paths."
+        "Anchors are repository-relative paths to whole files."
     ),
     log_level="WARNING",
 )
@@ -244,7 +344,8 @@ mcp = FastMCP(
         "once the conclusion is supported, even when the user did not request "
         "persistence, and anchor it to the relevant files. Do not store routine "
         "edits, formatting or typo fixes, transient progress, or facts obvious "
-        "from the current code."
+        "from the current code. Anchors must be repository-relative paths to "
+        "existing whole files."
     ),
     annotations=ToolAnnotations(
         title="Save Nutcracker memory",
@@ -256,22 +357,55 @@ mcp = FastMCP(
     structured_output=True,
 )
 def memory_save_tool(
-    summary: str,
-    anchors: list[AnchorInput],
-    type: str = EpisodeType.OBSERVATION.value,
-    observations: list[str] | None = None,
+    summary: Annotated[
+        str,
+        Field(description="Concise durable technical conclusion to remember."),
+    ],
+    primary_path: Annotated[
+        str,
+        Field(
+            description=(
+                "Repository-relative path to the primary existing file supporting "
+                "this memory. Nutcracker MVP anchors at whole-file level."
+            )
+        ),
+    ],
+    related_paths: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Optional repository-relative paths to additional existing files "
+                "supporting this memory. Nutcracker MVP anchors at whole-file level."
+            )
+        ),
+    ] = None,
+    type: Annotated[
+        str,
+        Field(
+            description=(
+                "Optional episode category. Common aliases are normalized and "
+                "unknown values safely fall back to observation."
+            )
+        ),
+    ] = EpisodeType.OBSERVATION.value,
+    observations: Annotated[
+        list[str] | None,
+        Field(description="Optional supporting facts behind the conclusion."),
+    ] = None,
     decision: str | None = None,
-) -> dict[str, Any]:
+) -> CallToolResult:
     """Save an Episode using explicit repository-relative file anchors."""
 
-    return handle_memory_save(
+    result = handle_memory_save(
         _require_config(),
         summary=summary,
-        anchors=anchors,
+        primary_path=primary_path,
+        related_paths=related_paths,
         type=type,
         observations=observations,
         decision=decision,
     )
+    return _tool_result(_compact_save_content(result), result)
 
 
 @mcp.tool(
@@ -297,15 +431,16 @@ def memory_recall_tool(
     query: str,
     limit: int = 5,
     min_similarity: float = 0.0,
-) -> dict[str, Any]:
+) -> CallToolResult:
     """Recall memories from the repository configured at server startup."""
 
-    return handle_memory_recall(
+    result = handle_memory_recall(
         _require_config(),
         query=query,
         limit=limit,
         min_similarity=min_similarity,
     )
+    return _tool_result(_compact_recall_content(result), result)
 
 
 def main() -> None:

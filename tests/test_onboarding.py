@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import sqlite3
 import subprocess
 import sys
@@ -13,6 +12,7 @@ import pytest
 from nutcracker_cli.onboarding import (
     AGENTS_END,
     AGENTS_START,
+    ACTIVE_MCP_NAME,
     CodexPreflightError,
     MCPConflictError,
     MCPRegistrationError,
@@ -25,6 +25,7 @@ from nutcracker_cli.onboarding import (
     install_agents_policy,
     mcp_server_name,
     run_doctor,
+    use_repository,
 )
 
 
@@ -83,7 +84,7 @@ def _write_mcp_config(
     environment_lines: list[str] | None = None,
     enabled: str | None = None,
 ) -> None:
-    name = mcp_server_name(repo)
+    name = ACTIVE_MCP_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"[mcp_servers.{name}]", f"command = {json.dumps(command)}", f"args = {args}"]
     if enabled is not None:
@@ -139,6 +140,7 @@ def test_init_creates_local_database_and_gitignore_once(
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"episodes", "anchors", "episode_embeddings"} <= tables
     assert calls[-1][1:4] == ["mcp", "add", result.mcp_name]
+    assert result.mcp_name == ACTIVE_MCP_NAME
 
     assert ensure_gitignore(tmp_path) is False
     assert (tmp_path / ".gitignore").read_text(encoding="utf-8").count(".nutcracker/") == 1
@@ -267,12 +269,12 @@ def test_mcp_command_generation_is_shell_and_platform_independent(tmp_path: Path
         codex_executable="codex",
     )
 
-    assert command[:4] == ["codex", "mcp", "add", mcp_server_name(tmp_path / "project with spaces")]
+    assert command[:4] == ["codex", "mcp", "add", ACTIVE_MCP_NAME]
     assert command[-2:] == ["-m", "mcp_server.server"]
     assert all("powershell" not in item.lower() and "shell=True" not in item for item in command)
 
 
-def test_mcp_names_are_deterministic_and_distinguish_same_basenames(tmp_path: Path) -> None:
+def test_legacy_mcp_names_remain_deterministic_for_migration(tmp_path: Path) -> None:
     first = tmp_path / "one" / "project"
     second = tmp_path / "two" / "project"
     first.mkdir(parents=True)
@@ -282,19 +284,9 @@ def test_mcp_names_are_deterministic_and_distinguish_same_basenames(tmp_path: Pa
     assert mcp_server_name(first) != mcp_server_name(second)
 
 
-def test_mcp_name_limits_an_extremely_long_slug(tmp_path: Path) -> None:
-    repo = tmp_path / ("project-" * 100)
-
-    name = mcp_server_name(repo)
-
-    assert len(name) <= len("nutcracker-") + 48 + 1 + 8
-    expected_hash = hashlib.sha256(str(repo.resolve()).encode("utf-8")).hexdigest()[:8]
-    assert name.endswith(f"-{expected_hash}")
-
-
 def _configured_repo(tmp_path: Path) -> tuple[Path, Path]:
     repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     (repo / ".nutcracker").mkdir()
     database = repo / ".nutcracker" / "memory.db"
     from storage.episode_store import init_db
@@ -314,7 +306,7 @@ def test_doctor_reports_valid_configuration(tmp_path: Path, monkeypatch: pytest.
     result = run_doctor(repo, config_path=config_path, probe_runner=_successful_probe)
 
     assert result.ready is True
-    assert all(ok for _, ok, _ in result.checks)
+    assert all(check.status == "ok" for check in result.checks)
 
 
 def test_doctor_reports_missing_mcp_registration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -324,8 +316,8 @@ def test_doctor_reports_missing_mcp_registration(tmp_path: Path, monkeypatch: py
 
     result = run_doctor(repo, config_path=tmp_path / "absent.toml")
 
-    registration = next(check for check in result.checks if check[0] == "MCP registration")
-    assert registration[1] is False
+    registration = next(check for check in result.checks if check.name == "MCP registration")
+    assert registration.status == "error"
     assert result.ready is False
 
 
@@ -347,9 +339,9 @@ def test_doctor_rejects_empty_or_outdated_agents_policy(
 
     result = run_doctor(repo, config_path=tmp_path / "absent.toml")
 
-    policy = next(check for check in result.checks if check[0] == "AGENTS.md policy")
-    assert policy[1] is False
-    assert "outdated" in policy[2]
+    policy = next(check for check in result.checks if check.name == "AGENTS.md policy")
+    assert policy.status == "error"
+    assert "outdated" in policy.detail
 
 
 def test_doctor_rejects_inconsistent_agents_markers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -360,8 +352,8 @@ def test_doctor_rejects_inconsistent_agents_markers(tmp_path: Path, monkeypatch:
 
     result = run_doctor(repo, config_path=tmp_path / "absent.toml")
 
-    policy = next(check for check in result.checks if check[0] == "AGENTS.md policy")
-    assert policy[1] is False
+    policy = next(check for check in result.checks if check.name == "AGENTS.md policy")
+    assert policy.status == "error"
 
 
 def test_doctor_rejects_disabled_mcp_and_external_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -379,10 +371,10 @@ def test_doctor_rejects_disabled_mcp_and_external_database(tmp_path: Path, monke
 
     result = run_doctor(repo, config_path=config_path, probe_runner=_successful_probe)
 
-    registration = next(check for check in result.checks if check[0] == "MCP registration")
-    assert registration[1] is False
-    assert "disabled" in registration[2]
-    assert "database" in registration[2]
+    registration = next(check for check in result.checks if check.name == "MCP registration")
+    assert registration.status == "error"
+    assert "disabled" in registration.detail
+    assert "database" in registration.detail
 
 
 @pytest.mark.parametrize(
@@ -408,17 +400,17 @@ def test_doctor_probes_registered_mcp_process(
 
     result = run_doctor(repo, config_path=config_path, probe_runner=probe_runner)
 
-    process = next(check for check in result.checks if check[0] == "MCP server process and tools")
-    assert process[1] is expected
+    process = next(check for check in result.checks if check.name == "MCP server process and tools")
+    assert (process.status == "ok") is expected
 
 
-def test_init_aborts_on_conflicting_mcp_without_mutating_project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_preserves_local_setup_when_active_name_belongs_to_another_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_path = tmp_path / "codex" / "config.toml"
-    _write_mcp_config(config_path, tmp_path, command="different-python")
+    _write_mcp_config(config_path, tmp_path, args='["-m", "other.server"]')
     monkeypatch.setattr("nutcracker_cli.onboarding.shutil.which", lambda name: "/usr/bin/codex")
     calls: list[list[str]] = []
 
-    with pytest.raises(MCPConflictError, match="Existing MCP registration differs"):
+    with pytest.raises(MCPConflictError, match="not a recognizable Nutcracker"):
         initialize_repository(
             tmp_path,
             runner=_successful_runner(calls),
@@ -426,9 +418,9 @@ def test_init_aborts_on_conflicting_mcp_without_mutating_project(tmp_path: Path,
             config_path=config_path,
         )
 
-    assert not (tmp_path / ".nutcracker").exists()
-    assert not (tmp_path / ".gitignore").exists()
-    assert not (tmp_path / "AGENTS.md").exists()
+    assert (tmp_path / ".nutcracker" / "memory.db").is_file()
+    assert (tmp_path / ".gitignore").is_file()
+    assert (tmp_path / "AGENTS.md").is_file()
     assert not any(call[1:3] in (["mcp", "add"], ["mcp", "remove"]) for call in calls)
 
 
@@ -500,3 +492,145 @@ def test_read_codex_config_rejects_invalid_toml(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Cannot read Codex configuration"):
         _read_codex_config(config)
+
+
+def test_use_registers_global_mcp_for_initialized_repository(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
+    repo, _ = _configured_repo(tmp_path)
+    calls: list[list[str]] = []
+
+    result = use_repository(
+        repo,
+        runner=_successful_runner(calls),
+        python_executable="python-for-test",
+        config_path=tmp_path / "absent.toml",
+    )
+
+    assert result.repo_root == repo.resolve()
+    assert result.mcp_changed is True
+    assert calls[-1][:4] == ["/test/bin/codex", "mcp", "add", ACTIVE_MCP_NAME]
+    assert f"NUTCRACKER_REPO_ROOT={repo.resolve()}" in calls[-1]
+
+
+def test_use_is_idempotent_for_the_active_repository(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
+    repo, _ = _configured_repo(tmp_path)
+    config_path = tmp_path / "codex" / "config.toml"
+    _write_mcp_config(config_path, repo, command="python-for-test")
+    calls: list[list[str]] = []
+
+    result = use_repository(
+        repo,
+        runner=_successful_runner(calls),
+        python_executable="python-for-test",
+        config_path=config_path,
+    )
+
+    assert result.mcp_changed is False
+    assert not any(call[1:3] in (["mcp", "add"], ["mcp", "remove"]) for call in calls)
+
+
+def test_use_switches_the_single_active_registration(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
+    first, _ = _configured_repo(tmp_path)
+    second = tmp_path / "second repo"
+    second.mkdir()
+    (second / ".nutcracker").mkdir()
+    from storage.episode_store import init_db
+
+    init_db(str(second / ".nutcracker" / "memory.db"))
+    install_agents_policy(second)
+    config_path = tmp_path / "codex" / "config.toml"
+    _write_mcp_config(config_path, first, command="python-for-test")
+    calls: list[list[str]] = []
+
+    result = use_repository(
+        second,
+        runner=_successful_runner(calls),
+        python_executable="python-for-test",
+        config_path=config_path,
+    )
+
+    assert result.mcp_changed is True
+    assert [call[1:3] for call in calls if call[1:3] in (["mcp", "remove"], ["mcp", "add"])] == [["mcp", "remove"], ["mcp", "add"]]
+    assert f"NUTCRACKER_REPO_ROOT={second.resolve()}" in calls[-1]
+
+
+def test_use_restores_previous_registration_if_switch_add_fails(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
+    first, _ = _configured_repo(tmp_path)
+    second, _ = _configured_repo(tmp_path / "second")
+    config_path = tmp_path / "codex" / "config.toml"
+    _write_mcp_config(config_path, first, command="python-for-test")
+    calls: list[list[str]] = []
+
+    def fail_new_add(arguments: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        if arguments[1:3] == ["mcp", "add"] and f"NUTCRACKER_REPO_ROOT={second.resolve()}" in arguments:
+            return _completed(arguments, returncode=1, stderr="new registration failed")
+        if arguments[:3] == ["git", "rev-parse", "--show-toplevel"]:
+            return _completed(arguments, f"{cwd}\n")
+        return _completed(arguments)
+
+    with pytest.raises(MCPRegistrationError, match="previous Nutcracker registration was restored"):
+        use_repository(
+            second,
+            runner=fail_new_add,
+            python_executable="python-for-test",
+            config_path=config_path,
+        )
+
+    assert [call[1:3] for call in calls if call[1:3] in (["mcp", "remove"], ["mcp", "add"])] == [
+        ["mcp", "remove"],
+        ["mcp", "add"],
+        ["mcp", "add"],
+    ]
+    assert f"NUTCRACKER_REPO_ROOT={first.resolve().as_posix()}" in calls[-1]
+
+
+def test_use_rejects_a_repository_that_has_not_been_initialized(
+    tmp_path: Path,
+    codex_available: None,
+) -> None:
+    with pytest.raises(ValueError, match="not initialized"):
+        use_repository(tmp_path, runner=_successful_runner([]), config_path=tmp_path / "config.toml")
+
+
+def test_doctor_warns_when_another_repository_is_active(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    current, _ = _configured_repo(tmp_path)
+    other, _ = _configured_repo(tmp_path / "other")
+    config_path = tmp_path / "codex" / "config.toml"
+    _write_mcp_config(config_path, other, command=sys.executable)
+    monkeypatch.setattr("nutcracker_cli.onboarding.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr("nutcracker_cli.onboarding.detect_repo_root", lambda cwd: detect_repo_root(current, runner=_git_runner))
+
+    result = run_doctor(current, config_path=config_path, probe_runner=_successful_probe)
+
+    registration = next(check for check in result.checks if check.name == "MCP registration")
+    assert registration.status == "warn"
+    assert "nutcracker use" in registration.detail
+    assert result.ready is False
+
+
+def test_doctor_reports_legacy_mcp_registrations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, _ = _configured_repo(tmp_path)
+    config_path = tmp_path / "codex" / "config.toml"
+    _write_mcp_config(config_path, repo, command=sys.executable)
+    with config_path.open("a", encoding="utf-8") as config:
+        config.write("\n[mcp_servers.nutcracker-old-12345678]\ncommand = 'python'\n")
+    monkeypatch.setattr("nutcracker_cli.onboarding.shutil.which", lambda name: "/usr/bin/codex")
+    monkeypatch.setattr("nutcracker_cli.onboarding.detect_repo_root", lambda cwd: detect_repo_root(repo, runner=_git_runner))
+
+    result = run_doctor(repo, config_path=config_path, probe_runner=_successful_probe)
+
+    legacy = next(check for check in result.checks if check.name == "Legacy MCP registrations")
+    assert legacy.status == "warn"
+    assert "codex mcp remove nutcracker-old-12345678" in legacy.detail
